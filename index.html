@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+  <meta charset='UTF-8'/>
+  <meta name='viewport' content='width=device-width, initial-scale=1.0'/>
+  <title>Laser's Video Summary App</title>
+  <script src='https://cdn.tailwindcss.com'></script>
+</head>
+<body class='bg-gray-50'>
+  <div class='max-w-2xl mx-auto p-6'>
+    <h1 class='text-3xl font-bold text-gray-800 mb-6'>Laser's Video Summary App</h1>
+
+    <div class='space-y-4'>
+      <div>
+        <label for='apiKey' class='block text-sm font-medium text-gray-700'>OpenAI API Key</label>
+        <input type='text' id='apiKey' placeholder='Paste your OpenAI API key here' class='mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500' />
+      </div>
+
+      <div>
+        <label for='videoInput' class='block text-sm font-medium text-gray-700'>Upload Video</label>
+        <input type='file' id='videoInput' accept='video/*' class='mt-1 block w-full text-gray-700' />
+      </div>
+
+      <div id='audioContainer' class='mt-4'></div>
+
+      <div>
+        <label for='sumPrompt' class='block text-sm font-medium text-gray-700'>Summarization Prompt</label>
+        <textarea id='sumPrompt' class='mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500'>Please provide a concise, bullet-point summary of the following transcript.</textarea>
+      </div>
+
+      <button id='processBtn' class='mt-4 inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500'>Start Processing</button>
+      <div id='status' class='mt-2 text-sm italic text-gray-600'></div>
+    </div>
+
+    <div class='mt-8'>
+      <h2 class='text-xl font-semibold text-gray-800'>Transcript</h2>
+      <div id='transcript' class='mt-2 p-4 bg-gray-100 rounded-md whitespace-pre-wrap'></div>
+    </div>
+
+    <div class='mt-6'>
+      <h2 class='text-xl font-semibold text-gray-800'>Summary</h2>
+      <div id='summary' class='mt-2 p-4 bg-gray-100 rounded-md whitespace-pre-wrap'></div>
+    </div>
+  </div>
+
+  <script>
+    // Hyperparameters
+    const TRANSCRIPTION_MODEL = 'gpt-4o-mini-transcribe';
+    const SUMMARIZATION_MODEL = 'gpt-4o-2024-08-06';
+
+    // Utility: convert AudioBuffer to WAV Blob
+    function bufferToWave(abuffer) {
+      const numOfChan = abuffer.numberOfChannels;
+      const length = abuffer.length * numOfChan * 2 + 44;
+      const buffer = new ArrayBuffer(length);
+      const view = new DataView(buffer);
+      // RIFF header
+      writeUTFBytes(view, 0, 'RIFF');
+      view.setUint32(4, 36 + abuffer.length * numOfChan * 2, true);
+      writeUTFBytes(view, 8, 'WAVE');
+      writeUTFBytes(view, 12, 'fmt ');
+      view.setUint32(16, 16, true); // Subchunk1Size
+      view.setUint16(20, 1, true); // PCM = 1
+      view.setUint16(22, numOfChan, true);
+      view.setUint32(24, abuffer.sampleRate, true);
+      view.setUint32(28, abuffer.sampleRate * numOfChan * 2, true);
+      view.setUint16(32, numOfChan * 2, true);
+      view.setUint16(34, 16, true);
+      writeUTFBytes(view, 36, 'data');
+      view.setUint32(40, abuffer.length * numOfChan * 2, true);
+      // write interleaved data
+      let offset = 44;
+      for (let i = 0; i < abuffer.length; i++) {
+        for (let channel = 0; channel < numOfChan; channel++) {
+          let sample = abuffer.getChannelData(channel)[i];
+          sample = Math.max(-1, Math.min(1, sample));
+          view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7FFF, true);
+          offset += 2;
+        }
+      }
+      return new Blob([buffer], { type: 'audio/wav' });
+    }
+    function writeUTFBytes(view, offset, string) {
+      for (let i = 0; i < string.length; i++) {
+        view.setUint8(offset + i, string.charCodeAt(i));
+      }
+    }
+
+    // Extract audio using Web Audio + OfflineAudioContext
+    async function extractAudio(file) {
+      // Read file into ArrayBuffer
+      const arrayBuffer = await file.arrayBuffer();
+      // decode offline
+      const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const decoded = await audioCtx.decodeAudioData(arrayBuffer);
+      // use OfflineAudioContext to render entire buffer
+      const offlineCtx = new OfflineAudioContext(decoded.numberOfChannels, decoded.length, decoded.sampleRate);
+      const source = offlineCtx.createBufferSource();
+      source.buffer = decoded;
+      source.connect(offlineCtx.destination);
+      source.start();
+      const rendered = await offlineCtx.startRendering();
+      // convert to WAV blob
+      return bufferToWave(rendered);
+    }
+
+    // Transcribe audio blob to JSON text
+    async function transcribeAudio(blob) {
+      const apiKey = localStorage.getItem('openai_api_key');
+      if (!apiKey) throw new Error('Missing API key.');
+      const form = new FormData();
+      form.append('file', blob, 'audio.wav');
+      form.append('model', TRANSCRIPTION_MODEL);
+      const res = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + apiKey },
+        body: form
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error?.message || res.statusText);
+      }
+      const data = await res.json();
+      console.log('Transcription response:', data);
+      return data.text;
+    }
+
+    // Summarize text
+    async function summarizeText(text, prompt) {
+      const apiKey = localStorage.getItem('openai_api_key');
+      const messages = [
+        { role: 'system', content: 'You are an expert summarizer.' },
+        { role: 'user', content: `${prompt}\n\n${text}` }
+      ];
+      const res = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + apiKey
+        },
+        body: JSON.stringify({ model: SUMMARIZATION_MODEL, messages })
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.error?.message || res.statusText);
+      }
+      const json = await res.json();
+      return json.choices?.[0]?.message?.content.trim();
+    }
+
+    // UI
+    document.addEventListener('DOMContentLoaded', () => {
+      const apiKeyInput = document.getElementById('apiKey');
+      const videoInput = document.getElementById('videoInput');
+      const audioContainer = document.getElementById('audioContainer');
+      const sumPromptEl = document.getElementById('sumPrompt');
+      const processBtn = document.getElementById('processBtn');
+      const statusEl = document.getElementById('status');
+      const transcriptEl = document.getElementById('transcript');
+      const summaryEl = document.getElementById('summary');
+
+      apiKeyInput.value = localStorage.getItem('openai_api_key') || '';
+      sumPromptEl.value = localStorage.getItem('sum_prompt') || sumPromptEl.value;
+
+      apiKeyInput.addEventListener('change', () => localStorage.setItem('openai_api_key', apiKeyInput.value.trim()));
+      sumPromptEl.addEventListener('change', () => localStorage.setItem('sum_prompt', sumPromptEl.value.trim()));
+
+      processBtn.addEventListener('click', async () => {
+        statusEl.textContent = '';
+        transcriptEl.textContent = '';
+        summaryEl.textContent = '';
+        audioContainer.innerHTML = '';
+        const file = videoInput.files[0];
+        if (!apiKeyInput.value.trim()) return statusEl.textContent = 'Enter API key.';
+        if (!file) return statusEl.textContent = 'Select a video.';
+        try {
+          statusEl.textContent = '🔊 Extracting audio…';
+          const audioBlob = await extractAudio(file);
+          const audioURL = URL.createObjectURL(audioBlob);
+          audioContainer.innerHTML = `<audio controls src="${audioURL}" class="w-full mt-2"></audio>`;
+
+          statusEl.textContent = '✍️ Transcribing…';
+          const text = await transcribeAudio(audioBlob);
+          transcriptEl.textContent = text;
+
+          statusEl.textContent = '📝 Summarizing…';
+          const summary = await summarizeText(text, sumPromptEl.value.trim());
+          summaryEl.textContent = summary;
+
+          statusEl.textContent = '✅ Done!';
+        } catch (e) {
+          console.error(e);
+          statusEl.textContent = 'Error: ' + e.message;
+        }
+      });
+    });
+  </script>
+</body>
+</html>
